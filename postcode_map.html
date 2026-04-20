@@ -17,13 +17,12 @@
   }
   .label-tc div {
     color: #065f46;
-    background: rgba(73,214,157,0.2);   /* matches #49d69d */
+    background: rgba(73,214,157,0.2);
     border: 1px solid #49d69d;
-  } 
-
+  }
   .label-sn div {
     color: #6b004f;
-    background: rgba(255,51,187,0.2);   /* matches #ff33bb */
+    background: rgba(255,51,187,0.2);
     border: 1px solid #ff33bb;
   }
   .legend {
@@ -96,8 +95,9 @@
     attribution: '&copy; OSM &copy; CARTO', subdomains: 'abcd', maxZoom: 19
   });
 
+  // Both layers on by default
   const tcLayer = L.layerGroup().addTo(map);
-  const snLayer = L.layerGroup();
+  const snLayer = L.layerGroup().addTo(map);
   const searchLayer = L.layerGroup().addTo(map);
 
   function esc(s) {
@@ -128,11 +128,79 @@
            '<span style="color:#666;">Postcodes:</span> <code>' + esc(loc.postcodes.join(', ')) + '</code>';
   }
 
+  // ─── Polygon centroid helpers ───────────────────────────
+  // Area-weighted centroid for a single ring (array of [lng,lat]).
+  // Using the "shoelace" formula — produces a point that sits inside convex
+  // polygons and close to the visual centre of most real-world shapes.
+  function ringCentroid(ring) {
+    let twiceArea = 0, cx = 0, cy = 0;
+    for (let i = 0, n = ring.length; i < n - 1; i++) {
+      const [x0, y0] = ring[i];
+      const [x1, y1] = ring[i + 1];
+      const cross = x0 * y1 - x1 * y0;
+      twiceArea += cross;
+      cx += (x0 + x1) * cross;
+      cy += (y0 + y1) * cross;
+    }
+    if (twiceArea === 0) {
+      // Fallback: simple average of vertices
+      let sx = 0, sy = 0;
+      ring.forEach(p => { sx += p[0]; sy += p[1]; });
+      return [sx / ring.length, sy / ring.length];
+    }
+    const factor = 1 / (3 * twiceArea);
+    return [cx * factor, cy * factor];
+  }
+
+  // Centroid of a GeoJSON geometry (Polygon or MultiPolygon).
+  // For MultiPolygon, we use the largest polygon's outer ring — this avoids
+  // labels landing in the middle of a bounding box that contains no land.
+  function geometryCentroid(geom) {
+    if (!geom) return null;
+    if (geom.type === 'Polygon') {
+      return ringCentroid(geom.coordinates[0]);
+    }
+    if (geom.type === 'MultiPolygon') {
+      // Pick largest polygon by perimeter (cheap proxy for area)
+      let best = null, bestLen = -1;
+      geom.coordinates.forEach(poly => {
+        const outer = poly[0];
+        let len = 0;
+        for (let i = 0; i < outer.length - 1; i++) {
+          const dx = outer[i + 1][0] - outer[i][0];
+          const dy = outer[i + 1][1] - outer[i][1];
+          len += Math.sqrt(dx * dx + dy * dy);
+        }
+        if (len > bestLen) { bestLen = len; best = outer; }
+      });
+      return best ? ringCentroid(best) : null;
+    }
+    return null;
+  }
+
+  // Compute the best label position for a location: average of the centroids
+  // of all its polygon features, falling back to hardcoded lat/lng if no
+  // polygons were resolved.
+  function labelPosition(loc) {
+    if (loc.features && loc.features.length) {
+      let sx = 0, sy = 0, n = 0;
+      loc.features.forEach(f => {
+        const c = geometryCentroid(f.geometry);
+        if (c) { sx += c[0]; sy += c[1]; n++; }
+      });
+      if (n > 0) {
+        // centroid is [lng, lat], Leaflet expects [lat, lng]
+        return [sy / n, sx / n];
+      }
+    }
+    if (loc.lat != null) return [loc.lat, loc.lng];
+    return null;
+  }
+
   function addLocation(loc, color, fillOpacity, layer, labelClass) {
     const popup = buildPopup(loc, color);
     const tooltip = loc.name;
 
-    // Draw polygon features
     loc.features.forEach(f => {
       L.geoJSON(f.geometry, { style: styleFor(color, f.fallback, fillOpacity) })
         .bindPopup(popup, { maxWidth: 320 })
@@ -140,8 +208,9 @@
         .addTo(layer);
     });
 
-    if (loc.lat != null) {
-      makeLabel([loc.lat, loc.lng], loc.name, labelClass).addTo(layer);
+    const pos = labelPosition(loc);
+    if (pos) {
+      makeLabel(pos, loc.name, labelClass).addTo(layer);
     }
   }
 
@@ -177,7 +246,6 @@
     try {
       const resp = await fetch('https://api.postcodes.io/postcodes/' + encodeURIComponent(raw));
       if (!resp.ok) {
-        // Try outcode (just district part, e.g. SW1A)
         const outcodeResp = await fetch('https://api.postcodes.io/outcodes/' + encodeURIComponent(raw));
         if (!outcodeResp.ok) throw new Error('Postcode not found');
         const oc = (await outcodeResp.json()).result;
